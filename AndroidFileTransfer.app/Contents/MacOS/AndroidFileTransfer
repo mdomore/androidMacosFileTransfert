@@ -1,0 +1,74 @@
+#!/bin/bash
+# Get the directory where the app bundle is located
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PROJECT_DIR="$APP_DIR/Contents/Resources"
+
+# Change to the project directory
+cd "$PROJECT_DIR"
+
+# Function to get local IP addresses
+get_local_ip() {
+    local ip=$(ifconfig | grep -E "inet [0-9]" | grep -v "127.0.0.1" | head -1 | awk '{print $2}')
+    echo "$ip"
+}
+
+# Function to show URL in a dialog
+show_url_dialog() {
+    local ip="$1"
+    local port="5001"
+    local url="http://$ip:$port"
+    
+    osascript -e "display dialog \"🚀 Android File Transfer Server Started!
+
+📱 Access URL: $url
+
+📋 Instructions:
+1. Copy the URL above
+2. Open your phone's web browser  
+3. Paste the URL and press Enter
+4. Start transferring files!
+
+The server will continue running in the background.
+Click 'Open Browser' to open the URL now.\" buttons {\"OK\", \"Open Browser\"} default button \"Open Browser\" with title \"Android File Transfer\""
+    
+    if [ $? -eq 0 ]; then
+        open "$url"
+    fi
+}
+
+# Function to start the web server
+start_server() {
+    if ! command -v python3 &> /dev/null; then
+        osascript -e 'display dialog "Python 3 is required but not installed. Please install Python 3 and try again." buttons {"OK"} default button "OK"'
+        exit 1
+    fi
+    
+    if [ ! -d "venv" ]; then
+        echo "Creating virtual environment..."
+        python3 -m venv venv
+    fi
+    
+    source venv/bin/activate
+    
+    if [ -f "requirements.txt" ]; then
+        echo "Installing dependencies..."
+        pip install -r requirements.txt --quiet
+    fi
+    
+    local_ip=$(get_local_ip)
+    show_url_dialog "$local_ip"
+    
+    echo "Starting Android File Transfer server..."
+    echo "Access URL: http://$local_ip:5001"
+    echo "Press Ctrl+C to stop the server"
+    
+    python3 backend/web_server.py
+}
+
+cleanup() {
+    echo "Stopping Android File Transfer server..."
+    exit 0
+}
+
+trap cleanup SIGINT SIGTERM
+start_server
