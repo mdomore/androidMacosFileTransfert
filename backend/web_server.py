@@ -33,10 +33,16 @@ class WebFileManager:
         except:
             return "127.0.0.1"
     
-    def list_files(self, path=""):
+    def list_files(self, path="", base_path=None):
         """List files in the transfer directory"""
         try:
-            full_path = Path(self.base_path) / path if path else Path(self.base_path)
+            # Use provided base_path or default to self.base_path
+            if base_path:
+                if base_path.startswith('~/'):
+                    base_path = str(Path(base_path).expanduser())
+                full_path = Path(base_path) / path if path else Path(base_path)
+            else:
+                full_path = Path(self.base_path) / path if path else Path(self.base_path)
             
             if not full_path.exists():
                 return []
@@ -45,9 +51,11 @@ class WebFileManager:
             for item in full_path.iterdir():
                 try:
                     stat = item.stat()
+                    # Calculate relative path from the actual base path used
+                    actual_base = Path(base_path).expanduser() if base_path and base_path.startswith('~/') else Path(base_path) if base_path else Path(self.base_path)
                     file_info = {
                         'name': item.name,
-                        'path': str(item.relative_to(Path(self.base_path))),
+                        'path': str(item.relative_to(actual_base)),
                         'is_dir': item.is_dir(),
                         'size': stat.st_size if item.is_file() else None,
                         'date': time.strftime('%b %d %H:%M', time.localtime(stat.st_mtime)),
@@ -740,6 +748,11 @@ HTML_TEMPLATE = """
             <div class="progress" id="progress" style="display: none;">
                 <div class="progress-bar" id="progressBar"></div>
             </div>
+            <div id="uploadStatus" style="display: none; margin-top: 10px; padding: 10px; background: #f8f9fa; border-radius: 4px; text-align: center;">
+                <span id="uploadStatusText"></span>
+                <button id="resumeUploadBtn" onclick="resumeUploads()" style="display: none; margin-left: 10px; padding: 5px 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">Resume</button>
+                <button id="cancelUploadBtn" onclick="cancelUploads()" style="display: none; margin-left: 10px; padding: 5px 10px; background: #dc3545; color: white; border: none; border-radius: 4px; cursor: pointer;">Cancel</button>
+            </div>
         </div>
         
         <div class="files-section">
@@ -779,6 +792,7 @@ HTML_TEMPLATE = """
         document.addEventListener('DOMContentLoaded', function() {
             loadFiles();
             updateUploadPathDisplay();
+            resumeUploads(); // Check for interrupted uploads
         });
         
         // File upload handling
@@ -789,18 +803,44 @@ HTML_TEMPLATE = """
             }
         });
         
+        // Store upload state for resumability
+        let uploadState = {
+            files: [],
+            currentIndex: 0,
+            successCount: 0,
+            failCount: 0,
+            isUploading: false
+        };
+        
         async function uploadFiles(files) {
             const progress = document.getElementById('progress');
             const progressBar = document.getElementById('progressBar');
             
+            // Initialize upload state
+            uploadState.files = Array.from(files);
+            uploadState.currentIndex = 0;
+            uploadState.successCount = 0;
+            uploadState.failCount = 0;
+            uploadState.isUploading = true;
+            
             progress.style.display = 'block';
             progressBar.style.width = '0%';
+            showUploadStatus(`📤 Starting upload of ${files.length} files...`, false, true);
             
-            for (let i = 0; i < files.length; i++) {
-                const file = files[i];
+            // Store state in localStorage for recovery
+            localStorage.setItem('uploadState', JSON.stringify(uploadState));
+            
+            await processUploadQueue();
+        }
+        
+        async function processUploadQueue() {
+            const progress = document.getElementById('progress');
+            const progressBar = document.getElementById('progressBar');
+            
+            while (uploadState.currentIndex < uploadState.files.length && uploadState.isUploading) {
+                const file = uploadState.files[uploadState.currentIndex];
                 const formData = new FormData();
                 formData.append('file', file);
-                formData.append('path', currentPath);
                 formData.append('upload_directory', uploadDirectory);
                 
                 try {
@@ -810,31 +850,111 @@ HTML_TEMPLATE = """
                     });
                     
                     if (response.ok) {
-                        showStatus('File uploaded successfully: ' + file.name, 'success');
+                        uploadState.successCount++;
+                        showStatus(`✅ Uploaded ${uploadState.currentIndex + 1}/${uploadState.files.length}: ${file.name}`, 'success');
                     } else {
-                        showStatus('Failed to upload: ' + file.name, 'error');
+                        uploadState.failCount++;
+                        showStatus(`❌ Failed ${uploadState.currentIndex + 1}/${uploadState.files.length}: ${file.name}`, 'error');
                     }
                 } catch (error) {
-                    showStatus('Error uploading: ' + file.name, 'error');
+                    uploadState.failCount++;
+                    showStatus(`❌ Error ${uploadState.currentIndex + 1}/${uploadState.files.length}: ${file.name}`, 'error');
                 }
                 
+                uploadState.currentIndex++;
+                
                 // Update progress
-                const progressPercent = ((i + 1) / files.length) * 100;
+                const progressPercent = (uploadState.currentIndex / uploadState.files.length) * 100;
                 progressBar.style.width = progressPercent + '%';
+                
+                // Update stored state
+                localStorage.setItem('uploadState', JSON.stringify(uploadState));
+                
+                // Small delay to prevent overwhelming the server
+                if (uploadState.currentIndex < uploadState.files.length) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                }
             }
             
-            // Hide progress after a delay
-            setTimeout(() => {
-                progress.style.display = 'none';
-            }, 2000);
+            // Check if upload completed
+            if (uploadState.currentIndex >= uploadState.files.length) {
+                // Show final summary
+                if (uploadState.successCount > 0 && uploadState.failCount === 0) {
+                    showStatus(`🎉 All ${uploadState.successCount} files uploaded successfully!`, 'success');
+                } else if (uploadState.successCount > 0 && uploadState.failCount > 0) {
+                    showStatus(`⚠️ ${uploadState.successCount} uploaded, ${uploadState.failCount} failed`, 'error');
+                } else {
+                    showStatus(`❌ All ${uploadState.failCount} uploads failed`, 'error');
+                }
+                
+                // Clear state
+                uploadState.isUploading = false;
+                localStorage.removeItem('uploadState');
+                
+                // Hide progress after a delay
+                setTimeout(() => {
+                    progress.style.display = 'none';
+                }, 5000);
+                
+                // Refresh file list
+                loadFiles();
+            }
+        }
+        
+        // Resume uploads on page load
+        function resumeUploads() {
+            const storedState = localStorage.getItem('uploadState');
+            if (storedState) {
+                try {
+                    const state = JSON.parse(storedState);
+                    if (state.isUploading && state.currentIndex < state.files.length) {
+                        uploadState = state;
+                        showStatus(`🔄 Resuming upload: ${state.currentIndex}/${state.files.length} files`, 'success');
+                        processUploadQueue();
+                    }
+                } catch (error) {
+                    localStorage.removeItem('uploadState');
+                }
+            }
+        }
+        
+        // Pause uploads when page becomes hidden
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden && uploadState.isUploading) {
+                showUploadStatus(`⏸️ Upload paused (screen locked). Unlock to resume.`, true);
+            } else if (!document.hidden && uploadState.isUploading) {
+                showUploadStatus(`▶️ Upload resumed`, false);
+            }
+        });
+        
+        function showUploadStatus(message, showResume = false, showCancel = false) {
+            const statusDiv = document.getElementById('uploadStatus');
+            const statusText = document.getElementById('uploadStatusText');
+            const resumeBtn = document.getElementById('resumeUploadBtn');
+            const cancelBtn = document.getElementById('cancelUploadBtn');
             
-            // Refresh file list
-            loadFiles();
+            statusText.textContent = message;
+            statusDiv.style.display = 'block';
+            resumeBtn.style.display = showResume ? 'inline-block' : 'none';
+            cancelBtn.style.display = showCancel ? 'inline-block' : 'none';
+            
+            if (!showResume && !showCancel) {
+                setTimeout(() => {
+                    statusDiv.style.display = 'none';
+                }, 3000);
+            }
+        }
+        
+        function cancelUploads() {
+            uploadState.isUploading = false;
+            localStorage.removeItem('uploadState');
+            showUploadStatus('❌ Upload cancelled', false, false);
+            document.getElementById('progress').style.display = 'none';
         }
         
         async function loadFiles() {
             try {
-                const response = await fetch('/api/files?path=' + encodeURIComponent(currentPath));
+                const response = await fetch('/api/files?path=' + encodeURIComponent(currentPath) + '&base_path=' + encodeURIComponent(baseUploadDirectory));
                 const files = await response.json();
                 allFiles = files;
                 selectedFiles.clear();
@@ -1243,10 +1363,15 @@ def index():
 def list_files():
     """List files in the transfer directory"""
     path = request.args.get('path', '')
+    base_path = request.args.get('base_path', file_manager.base_path)
+    
     # Handle ~ expansion for relative paths
     if path and path.startswith('~/'):
         path = str(Path(path).expanduser())
-    files = file_manager.list_files(path)
+    if base_path and base_path.startswith('~/'):
+        base_path = str(Path(base_path).expanduser())
+    
+    files = file_manager.list_files(path, base_path)
     return jsonify(files)
 
 @app.route('/api/upload', methods=['POST'])
@@ -1257,20 +1382,24 @@ def upload_file():
             return jsonify({'error': 'No file provided'}), 400
         
         file = request.files['file']
-        path = request.form.get('path', '')
         upload_directory = request.form.get('upload_directory', file_manager.base_path)
         
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
         
-        # Create destination path using the specified upload directory
-        dest_path = Path(upload_directory) / path / file.filename
+        # Handle ~ expansion for upload directory
+        if upload_directory.startswith('~/'):
+            upload_directory = str(Path(upload_directory).expanduser())
+        
+        # Create destination path - upload_directory already contains the full path
+        dest_path = Path(upload_directory) / file.filename
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Save the file
         file.save(str(dest_path))
         
-        return jsonify({'success': True, 'filename': file.filename})
+        print(f"File uploaded to: {dest_path}")
+        return jsonify({'success': True, 'filename': file.filename, 'path': str(dest_path)})
     except Exception as e:
         print(f"Error uploading file: {e}")
         return jsonify({'error': 'Upload failed'}), 500
